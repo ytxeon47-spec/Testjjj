@@ -1,0 +1,89 @@
+name: Pure QEMU Windows (4 Cores / 16GB RAM + Red Hat VirtIO & Audio)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-qemu-win:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU & KVM Dependencies
+        run: |
+          echo "=== [STEP 1/4] Installing QEMU and Utilities ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            ovmf \
+            wget \
+            aria2
+
+          echo "=== Setting KVM permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+      - name: 2. Download Red Hat VirtIO Drivers ISO
+        run: |
+          echo "=== [STEP 2/4] Downloading Latest Red Hat VirtIO Drivers ISO ==="
+          # Официальный стабильный ISO с драйверами Red Hat (VirtIO, Audio, Network, Storage)
+          VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.262-1/virtio-win.iso"
+          
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o virtio-win.iso "$VIRTIO_URL" || wget -O /tmp/virtio-win.iso "$VIRTIO_URL"
+
+      - name: 3. Create Main Virtual Disk Image
+        run: |
+          echo "=== [STEP 3/4] Creating 256GB QCOW2 Disk ==="
+          qemu-img create -f qcow2 /tmp/win_disk.qcow2 256G
+
+      - name: 4. Launch Pure QEMU Windows
+        run: |
+          echo "=== [STEP 4/4] Launching QEMU with 4 Cores, 16GB RAM & VirtIO ==="
+
+          # Включаем эмуляцию аудио в фоновом режиме QEMU
+          export QEMU_AUDIO_DRV=none
+
+          # Укажи здесь нужную ссылку на установочный ISO-образ Windows
+          WIN_ISO_URL="https://archive.org/download/windows-10_20230409/Windows%2010.iso"
+
+          if [ ! -f /tmp/win_install.iso ]; then
+            echo "Downloading Windows ISO..."
+            aria2c -x 16 -s 16 -k 1M -d /tmp -o win_install.iso "$WIN_ISO_URL" || wget -O /tmp/win_install.iso "$WIN_ISO_URL"
+          fi
+
+          # Запуск QEMU c аппаратным KVM, Red Hat драйверами и звуком
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine q35,accel=kvm \
+            -m 16384 \
+            -smp 4,sockets=1,cores=4,threads=2 \
+            -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -drive file=/tmp/win_disk.qcow2,format=qcow2,index=0,media=disk,if=virtio \
+            -drive file=/tmp/win_install.iso,index=1,media=cdrom \
+            -drive file=/tmp/virtio-win.iso,index=2,media=cdrom \
+            -device ich9-intel-hda -device hda-duplex \
+            -vga qxl \
+            -vnc 127.0.0.1:0 \
+            -net nic,model=virtio \
+            -net user \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          echo "=================================================="
+          echo " PURE QEMU WINDOWS STARTED SUCCESSFULLY"
+          echo "=================================================="
+          echo " CPU Cores      : 4 Cores (Host Passthrough)"
+          echo " RAM Spec       : 16 GB"
+          echo " VirtIO Drivers : Attached (/tmp/virtio-win.iso)"
+          echo " Audio Controller: Intel HDA (hda-duplex)"
+          echo " VNC Display    : 127.0.0.1:0"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Virtual Machine Running... | $(date)"
+          done
