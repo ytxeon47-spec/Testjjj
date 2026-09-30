@@ -1,0 +1,183 @@
+name: Ultimate Windows 7 QEMU (4 Cores / 12GB RAM / 256GB Disk / 32GB USB Flash / Apps Pack)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win7-qemu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM & Storage Tools
+        run: |
+          echo "=== [STEP 1/4] Installing QEMU, KVM & ISO Tools ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-gui \
+            qemu-utils \
+            genisoimage \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
+            libvirglrenderer1 \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Main Virtual Disk (256GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 256G
+
+          echo "=== Creating Emulated USB Flash Drive (32GB RAW) ==="
+          qemu-img create -f raw /tmp/usb_flash_32G.img 32G
+
+      - name: 2. Download Windows 7 ISO, Apps & Build Custom CD-ROM
+        run: |
+          echo "=== [STEP 2/4] Downloading ISOs and Softwares ==="
+          
+          WIN7_URL="https://archive.org/download/windows-7-x-64_202205/windows%207%20x64.iso"
+          VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win.iso"
+          BANDICAM_URL="https://dl.bandicam.com/old/BDCAMSETUP_ENG_5_1_1_1837.EXE"
+          SUPERMIUM_URL="https://download.win32subsystem.live/supermium/releases/v144-r5/supermium_144_64_setup.exe"
+          DIRECTX_URL="https://directx.biz/files/directx/dxwebsetup.exe"
+          FIREFOX_URL="https://download-origin.cdn.mozilla.net/pub/mozilla.org/firefox/releases/115.0esr/win64/en-US/Firefox%20Setup%20115.0esr.exe"
+          AVICA_URL="https://download.avica.com/downloader/Avica_setup.exe"
+
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o win7.iso "$WIN7_URL" || wget -O /tmp/win7.iso "$WIN7_URL"
+
+          mkdir -p /tmp/apps
+          echo "Downloading Bandicam..."
+          wget -O /tmp/apps/BDCAMSETUP.exe "$BANDICAM_URL"
+          
+          echo "Downloading Supermium Browser..."
+          wget -O /tmp/apps/supermium_setup.exe "$SUPERMIUM_URL"
+          
+          echo "Downloading DirectX Setup..."
+          wget -O /tmp/apps/dxwebsetup.exe "$DIRECTX_URL"
+
+          echo "Downloading Firefox 115 ESR..."
+          wget -O /tmp/apps/Firefox_Setup_115.0esr.exe "$FIREFOX_URL"
+
+          echo "Downloading Avica Remote Desktop..."
+          wget -O /tmp/apps/Avica_setup.exe "$AVICA_URL" || curl -sSL -o /tmp/apps/Avica_setup.exe "$AVICA_URL"
+
+          echo "Downloading VirtIO Drivers ISO..."
+          wget -O /tmp/virtio.iso "$VIRTIO_URL"
+
+          mkdir -p /tmp/custom_iso
+          cp -r /tmp/apps/* /tmp/custom_iso/
+          
+          sudo apt-get install -y p7zip-full
+          7z x /tmp/virtio.iso -o/tmp/custom_iso/VirtIO_Drivers -y
+
+          genisoimage -o /tmp/software.iso -R -J /tmp/custom_iso
+
+          ls -lh /tmp/win7.iso /tmp/software.iso /tmp/usb_flash_32G.img
+
+      - name: 3. Connect Tailscale
+        run: |
+          echo "=== [STEP 3/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTHKEY }}"
+          
+          if [ -n "$AUTH_KEY" ]; then
+            echo "Attempting auto-login with TAILSCALE_AUTHKEY..."
+            sudo tailscale up --authkey="$AUTH_KEY" --hostname="win7-qemu-runner-${{ github.run_id }}" --accept-routes || true
+          fi
+
+          TS_IP=$(tailscale ip -4 || true)
+          if [ -z "$TS_IP" ]; then
+            echo "=================================================="
+            echo " ATTENTION: PLEASE VERIFY RUNNER IN TAILSCALE"
+            echo "=================================================="
+            
+            timeout 15s sudo tailscale up --hostname="win7-qemu-runner-${{ github.run_id }}" --accept-routes || true
+            
+            echo "=================================================="
+            echo " Waiting for you to approve link above..."
+            echo "=================================================="
+            
+            sudo tailscale up --hostname="win7-qemu-runner-${{ github.run_id }}" --accept-routes > /dev/null 2>&1 &
+            
+            RETRIES=0
+            while [ -z "$TS_IP" ] && [ $RETRIES -lt 60 ]; do
+                TS_IP=$(tailscale ip -4 || true)
+                sleep 3
+                RETRIES=$((RETRIES+1))
+            done
+          fi
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale authentication failed or timed out!"
+            exit 1
+          fi
+
+          echo "=================================================="
+          echo " Tailscale Successfully Connected!"
+          echo " Tailscale IP: $TS_IP"
+          echo "=================================================="
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4. Launch QEMU Windows 7 & noVNC Web Access
+        run: |
+          echo "=== [STEP 4/4] Starting QEMU Windows 7 Machine ==="
+          
+          export QEMU_AUDIO_DRV=none
+
+          # Запуск: 4 ядра + 12 ГБ ОЗУ (12288M) + 256ГБ ЖД + CD со софтом + 32ГБ USB Флешка
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine q35,accel=kvm \
+            -m 12288 \
+            -smp 4,sockets=1,cores=4,threads=1 \
+            -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk \
+            -drive file=/tmp/win7.iso,index=1,media=cdrom \
+            -drive file=/tmp/software.iso,index=2,media=cdrom \
+            -drive file=/tmp/usb_flash_32G.img,id=usbflash,format=raw,if=none \
+            -device usb-storage,drive=usbflash \
+            -device ich9-intel-hda -device hda-duplex \
+            -vga std \
+            -vnc 127.0.0.1:0 \
+            -netdev user,id=net0 \
+            -device e1000,netdev=net0 \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          NOVNC_DIR="/usr/share/novnc"
+          if [ -d "/usr/share/novnc/vnc_lite.html" ] || [ -f "/usr/share/novnc/vnc.html" ] || [ -f "/usr/share/novnc/index.html" ]; then
+            NOVNC_DIR="/usr/share/novnc"
+          elif [ -d "/usr/share/novnc" ]; then
+            NOVNC_DIR="/usr/share/novnc"
+          fi
+
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 7 QEMU READY (12GB RAM / 256GB Disk / 32GB USB)"
+          echo "=================================================="
+          echo " OS Image     : Windows 7 x64 ISO"
+          echo " Extra CD     : Avica, Firefox 115 ESR, Supermium, Bandicam, DirectX, VirtIO"
+          echo " USB Storage  : 32 GB Flash Drive"
+          echo " CPU Config   : 4 Cores / 1 Thread per core"
+          echo " RAM          : 12 GB (12288 MB)"
+          echo " Network      : Intel e1000 (Native Win7 Driver)"
+          echo " Storage Size : 256 GB Main Disk"
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Running | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
