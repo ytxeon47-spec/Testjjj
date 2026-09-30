@@ -1,0 +1,164 @@
+name: Ultimate Windows 11 QEMU (4 Cores / 16GB RAM / 512GB Disk / TPM 2.0)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win11-qemu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM, TPM & Storage Tools
+        run: |
+          echo "=== [STEP 1/4] Installing QEMU, KVM, swtpm & OVMF Firmware ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-gui \
+            qemu-utils \
+            swtpm \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
+            libvirglrenderer1 \
+            ovmf \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2 \
+            dosfstools \
+            mtools
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Main Virtual Disk (512GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 512G
+
+      - name: 2. Download Windows 11 ISO & Red Hat VirtIO Drivers
+        run: |
+          echo "=== [STEP 2/4] Downloading Windows 11 ISO & VirtIO Drivers ==="
+          
+          ISO_URL="https://software.download.prss.microsoft.com/dbazure/Windows11_Client_x64_en-us_26300_9457.iso?t=8ca400ee-77a2-4895-bce3-a28fa7739b54&P1=1790813078&P2=602&P3=2&P4=CjtK1tWv6jppynQnAdBznWZKnPiq9y%2bMqMWfSMcAxbX3lsCp68O4%2b19XMTh2b5u%2fLVjyZfwVT3fKpYVdm3%2b4Wsp0GoW%2b8ImDOUuIQlO%2f0pwhyibw2MUdZaqDK%2fAMt9RIc8airgzsBQXU0wSfbOHSDbU%2bV9mqpwnSFYEezFgaa75IqHim%2bfhRxnL0ZRyb9pDizUrP%2bvNLUyntJLYDH1yz%2bNvM%2fG%2bS46khfvxHCLAxazm1wN0LgGxHsO4JuFYXUSrNlls22UNhvv3wzOgKPl8M12yN834b74Qi7um%2baEhevr0vy2alWOPlNJ%2fMQkmdrlJXbLYZ6b6pA72YiwqCyQLgbg%3d%3d"
+          VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win.iso"
+          
+          echo "Downloading Windows 11 ISO..."
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o win11.iso "$ISO_URL" || wget -O /tmp/win11.iso "$ISO_URL"
+          
+          echo "Downloading Red Hat VirtIO Drivers ISO..."
+          aria2c -x 8 -s 8 -k 1M -d /tmp -o virtio.iso "$VIRTIO_URL" || wget -O /tmp/virtio.iso "$VIRTIO_URL"
+
+          ls -lh /tmp/win11.iso /tmp/virtio.iso
+
+      - name: 3. Connect Tailscale
+        run: |
+          echo "=== [STEP 3/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTHKEY }}"
+          
+          if [ -n "$AUTH_KEY" ]; then
+            echo "Attempting auto-login with TAILSCALE_AUTHKEY..."
+            sudo tailscale up --authkey="$AUTH_KEY" --hostname="win11-qemu-runner-${{ github.run_id }}" --accept-routes || true
+          fi
+
+          TS_IP=$(tailscale ip -4 || true)
+          if [ -z "$TS_IP" ]; then
+            echo "=================================================="
+            echo " ATTENTION: PLEASE VERIFY RUNNER IN TAILSCALE"
+            echo "=================================================="
+            
+            timeout 15s sudo tailscale up --hostname="win11-qemu-runner-${{ github.run_id }}" --accept-routes || true
+            
+            echo "=================================================="
+            echo " Waiting for you to approve link above..."
+            echo "=================================================="
+            
+            sudo tailscale up --hostname="win11-qemu-runner-${{ github.run_id }}" --accept-routes > /dev/null 2>&1 &
+            
+            RETRIES=0
+            while [ -z "$TS_IP" ] && [ $RETRIES -lt 60 ]; do
+                TS_IP=$(tailscale ip -4 || true)
+                sleep 3
+                RETRIES=$((RETRIES+1))
+            done
+          fi
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale authentication failed or timed out!"
+            exit 1
+          fi
+
+          echo "=================================================="
+          echo " Tailscale Successfully Connected!"
+          echo " Tailscale IP: $TS_IP"
+          echo "=================================================="
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4. Launch QEMU Windows 11 & noVNC Web Access
+        run: |
+          echo "=== [STEP 4/4] Starting TPM Emulator & QEMU Windows 11 ==="
+          
+          export QEMU_AUDIO_DRV=none
+
+          # Запуск программного TPM 2.0 модуля
+          mkdir -p /tmp/tpmstate
+          swtpm socket --tpmstate dir=/tmp/tpmstate \
+                       --ctrl type=unixio,path=/tmp/tpmstate/swtpm-sock \
+                       --tpm2 \
+                       --daemon
+
+          # Запуск QEMU: 4 ядра + 16 ГБ ОЗУ + 512 ГБ диск + TPM 2.0
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine q35,accel=kvm \
+            -m 16384 \
+            -smp 4,sockets=1,cores=4,threads=1 \
+            -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -chardev socket,id=chrtpm,path=/tmp/tpmstate/swtpm-sock \
+            -tpmdev emulator,id=tpm0,chardev=chrtpm \
+            -device tpm-tis,tpmdev=tpm0 \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk \
+            -drive file=/tmp/win11.iso,index=1,media=cdrom \
+            -drive file=/tmp/virtio.iso,index=2,media=cdrom \
+            -device ich9-intel-hda -device hda-duplex \
+            -vga qxl \
+            -vnc 127.0.0.1:0 \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          NOVNC_DIR="/usr/share/novnc"
+          if [ -d "/usr/share/novnc/vnc_lite.html" ] || [ -f "/usr/share/novnc/vnc.html" ] || [ -f "/usr/share/novnc/index.html" ]; then
+            NOVNC_DIR="/usr/share/novnc"
+          elif [ -d "/usr/share/novnc" ]; then
+            NOVNC_DIR="/usr/share/novnc"
+          fi
+
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 11 QEMU READY (4 Cores / 16GB RAM / 512GB Disk)"
+          echo "=================================================="
+          echo " OS Image     : Windows 11 ISO"
+          echo " Drivers ISO  : virtio-win.iso"
+          echo " CPU Config   : 4 Cores / 1 Thread per core"
+          echo " RAM          : 16 GB (16384 MB)"
+          echo " Security     : TPM 2.0 Emulated (swtpm)"
+          echo " Network      : VirtIO PCI Network Adapter"
+          echo " Storage Size : 512 GB Main Disk"
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Running | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
