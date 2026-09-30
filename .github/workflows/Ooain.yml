@@ -1,0 +1,153 @@
+name: Ultimate Windows 10 QEMU (2 Cores / 8GB RAM / 150GB Disk)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win10-qemu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM & Storage Tools
+        run: |
+          echo "=== [STEP 1/4] Installing QEMU, KVM & OVMF Firmware ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-gui \
+            qemu-utils \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
+            libvirglrenderer1 \
+            ovmf \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2 \
+            dosfstools \
+            mtools
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Main Virtual Disk (150GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 150G
+
+      - name: 2. Download Windows 10 ISO & Red Hat VirtIO Drivers
+        run: |
+          echo "=== [STEP 2/4] Downloading Windows 10 ISO & VirtIO Drivers ==="
+          
+          ISO_URL="https://archive.org/download/windows-10_20230409/Windows%2010.iso"
+          VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win.iso"
+          
+          echo "Downloading Windows 10 ISO..."
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o win10.iso "$ISO_URL" || wget -O /tmp/win10.iso "$ISO_URL"
+          
+          echo "Downloading Red Hat VirtIO Drivers ISO..."
+          aria2c -x 8 -s 8 -k 1M -d /tmp -o virtio.iso "$VIRTIO_URL" || wget -O /tmp/virtio.iso "$VIRTIO_URL"
+
+          ls -lh /tmp/win10.iso /tmp/virtio.iso
+
+      - name: 3. Connect Tailscale
+        run: |
+          echo "=== [STEP 3/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTHKEY }}"
+          
+          if [ -n "$AUTH_KEY" ]; then
+            echo "Attempting auto-login with TAILSCALE_AUTHKEY..."
+            sudo tailscale up --authkey="$AUTH_KEY" --hostname="win10-qemu-runner-${{ github.run_id }}" --accept-routes || true
+          fi
+
+          TS_IP=$(tailscale ip -4 || true)
+          if [ -z "$TS_IP" ]; then
+            echo "=================================================="
+            echo " ATTENTION: PLEASE VERIFY RUNNER IN TAILSCALE"
+            echo "=================================================="
+            
+            timeout 15s sudo tailscale up --hostname="win10-qemu-runner-${{ github.run_id }}" --accept-routes || true
+            
+            echo "=================================================="
+            echo " Waiting for you to approve link above..."
+            echo "=================================================="
+            
+            sudo tailscale up --hostname="win10-qemu-runner-${{ github.run_id }}" --accept-routes > /dev/null 2>&1 &
+            
+            RETRIES=0
+            while [ -z "$TS_IP" ] && [ $RETRIES -lt 60 ]; do
+                TS_IP=$(tailscale ip -4 || true)
+                sleep 3
+                RETRIES=$((RETRIES+1))
+            done
+          fi
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale authentication failed or timed out!"
+            exit 1
+          fi
+
+          echo "=================================================="
+          echo " Tailscale Successfully Connected!"
+          echo " Tailscale IP: $TS_IP"
+          echo "=================================================="
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4. Launch QEMU Windows 10 & noVNC Web Access
+        run: |
+          echo "=== [STEP 4/4] Starting QEMU Windows 10 Machine ==="
+          
+          export QEMU_AUDIO_DRV=none
+
+          # Запуск: 2 ядра + 8 ГБ ОЗУ + 150 ГБ диск + Q35 + Hyper-V + Intel HDA
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine q35,accel=kvm \
+            -m 4196 \
+            -smp 2,sockets=1,cores=2,threads=1 \
+            -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk \
+            -drive file=/tmp/win10.iso,index=1,media=cdrom \
+            -drive file=/tmp/virtio.iso,index=2,media=cdrom \
+            -device ich9-intel-hda -device hda-duplex \
+            -vga qxl \
+            -vnc 127.0.0.1:0 \
+            -net nic,model=virtio \
+            -net user \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          NOVNC_DIR="/usr/share/novnc"
+          if [ -d "/usr/share/novnc/vnc_lite.html" ] || [ -f "/usr/share/novnc/vnc.html" ] || [ -f "/usr/share/novnc/index.html" ]; then
+            NOVNC_DIR="/usr/share/novnc"
+          elif [ -d "/usr/share/novnc" ]; then
+            NOVNC_DIR="/usr/share/novnc"
+          fi
+
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 10 QEMU READY (2 Cores / 8GB RAM / 150GB Disk)"
+          echo "=================================================="
+          echo " OS Image     : Windows 10.iso"
+          echo " Drivers ISO  : virtio-win.iso"
+          echo " CPU Config   : 2 Cores"
+          echo " RAM          : 4 GB (4196 MB)"
+          echo " Audio        : Intel HDA (ich9-intel-hda)"
+          echo " Network      : High-Speed VirtIO Net"
+          echo " Storage Size : 150 GB Main Disk"
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Running | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
