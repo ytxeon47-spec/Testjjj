@@ -1,0 +1,83 @@
+name: Dockur Windows (Tiny10, Desktop Core i7, 128GB Disk, 16GB RAM)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-dockur-tiny10:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Setup KVM Environment
+        run: |
+          echo "=== [STEP 1/4] Setting up KVM & Docker ==="
+          sudo apt-get update
+          sudo apt-get install -y curl
+          
+          # Включаем доступ к KVM
+          sudo chmod 666 /dev/kvm || true
+
+      - name: 2. Connect Tailscale
+        run: |
+          echo "=== [STEP 2/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="dockur-tiny10-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 3. Launch Dockur Windows (Tiny10, 128GB Disk, Desktop i7 CPU)
+        run: |
+          echo "=== [STEP 3/4] Starting Dockur Windows Container ==="
+          
+          # Запуск контейнера dockur/windows:
+          # CPU_MODEL="Skylake-Client" — симулирует клиентский десктопный процессор
+          docker run -d \
+            --name windows \
+            --device=/dev/kvm \
+            --cap-add=NET_ADMIN \
+            -p 8006:8006 \
+            -p 3389:3389/tcp \
+            -p 3389:3389/udp \
+            -e VERSION="tiny10" \
+            -e DISK_SIZE="128G" \
+            -e RAM_SIZE="16G" \
+            -e CPU_CORES="8" \
+            -e CPU_MODEL="Skylake-Client,vendor=GenuineIntel" \
+            --restart always \
+            dockur/windows
+
+          sleep 10
+
+      - name: 4. Monitor Container & Keep Alive
+        run: |
+          echo "=================================================="
+          echo " DOCKUR TINY10 CONTAINER READY"
+          echo "=================================================="
+          echo " OS Version   : Tiny10 (Clean)"
+          echo " CPU Model    : Intel Desktop Core i7 (Skylake-Client)"
+          echo " RAM          : 16 GB"
+          echo " Disk Size    : 128 GB"
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006"
+          echo " RDP Access   : $TAILSCALE_IP:3389"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "Dockur Status Check | Tailscale IP: $TAILSCALE_IP | $(date)"
+            docker ps --filter "name=windows"
+          done
